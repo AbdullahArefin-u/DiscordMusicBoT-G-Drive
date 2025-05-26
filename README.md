@@ -156,5 +156,3 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Discord.js community
 - Google APIs Node.js Client
 - Contributors and testers
-
-## Made by Abdullah Arefin

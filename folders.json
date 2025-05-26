@@ -1,5 +1,10 @@
 {
     "folders": {
-        "default folder name": "default folder id"
+        "default": {
+            "id": "1aQiNUtB7Hdsucg76j6SeEb4LtqIP5t85",
+            "addedBy": "system",
+            "addedAt": 1709424000000,
+            "isGlobal": true
+        }
     }
 }

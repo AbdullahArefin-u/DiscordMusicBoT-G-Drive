@@ -45,6 +45,12 @@ const commands = [
                 description: 'Google Drive folder ID',
                 type: 3, // STRING
                 required: true
+            },
+            {
+                name: 'global',
+                description: 'Make this folder available to everyone (optional)',
+                type: 5, // BOOLEAN
+                required: false
             }
         ]
     },
@@ -101,6 +107,32 @@ const CONTROLS = {
     STOP: '⏹️'
 };
 
+// Define custom emojis
+const CUSTOM_EMOJIS = {
+    PLAY: '<:play:1376088659656314990>',  // Replace with your actual emoji ID
+    PAUSE: '<:pause:1376088651267706930>',
+    SKIP: '<:skip:1376088739163410542>',
+    STOP: '<a:stop:1376088848563437700>',
+    PREVIOUS: '<:previous:1376088687028207658>',  // Previous button emoji
+    SUCCESS: '<:success:1376088866330509423>',
+    ERROR: '<:error:1376088590991360110>',
+    INFO: '<:info:1376088618178973776>',
+    MUSIC: '<:music:1376088642002354267>',
+    QUEUE: '<:qu:1376088707479900241>',
+    SHUFFLE: '<:shuffle:1376088726626631710>',
+    VOLUME: '<:volume1:1376088905471758427>',
+    SPOTIFY: '<:Spotify:1376088835116761138>',
+    YOUTUBE: '<:youtube:1376088546389000344>',
+    SOUNDCLOUD: '<:Soundcloud:1376088811993567275>',
+    CONNECTED: '<:connected:1376088576030277673>',
+    JOINVC: '<:joinvc:1376088631168467074>',
+    HEADPHONES: '<a:headphones:1376088600877203530>',
+    INFINITY: '<a:infinity:1376088609488375839>',
+    LOOP: '<a:loop:1376088566404218952>',
+    TRASH: '<:trash:1376088882369663046>',
+    WARNING: '<:warnings:1376088965366546432>'
+};
+
 let currentPlayingMessage = null;
 
 // Add before the commands handling
@@ -113,6 +145,10 @@ const COOLDOWN_DURATION = 7 * 24 * 60 * 60 * 1000; // 1 week in milliseconds
 // Add a flag to track if we're currently processing a skip
 let isProcessingSkip = false;
 let skipInProgress = false;
+
+// Add global variables for loop state
+let isLooping = false;
+let previousSongs = [];  // Store previous songs for the previous button
 
 // Add helper function for cooldown check
 function checkCooldown(userId) {
@@ -166,7 +202,7 @@ let player = createAudioPlayer();
 let connection = null;
 let currentChannel = null;
 
-// Load songs when bot starts
+// Initialize emoji IDs when bot starts
 client.once('ready', async () => {
     console.log('Bot is ready!');
     
@@ -187,8 +223,8 @@ client.once('ready', async () => {
     
     if (folders.default) {
         console.log('Testing default folder access...');
-        const songs = await loadSongsFromDrive(folders.default.id);
-        console.log(`Found ${songs.length} songs in default folder`);
+        const testLoad = await loadSongsFromDrive(folders.default.id);
+        console.log(`Found ${testLoad.length} songs in default folder`);
     }
 
     await registerCommands();
@@ -212,7 +248,8 @@ function loadFolders() {
                         folders[name] = {
                             id: value,
                             addedBy: null,
-                            addedAt: Date.now()
+                            addedAt: Date.now(),
+                            isGlobal: false
                         };
                     } else {
                         // New format, use as is
@@ -231,7 +268,8 @@ function loadFolders() {
                 folders.default = {
                     id: process.env.DEFAULT_FOLDER_ID,
                     addedBy: 'system',
-                    addedAt: Date.now()
+                    addedAt: Date.now(),
+                    isGlobal: true
                 };
                 saveFolders(folders);
             }
@@ -245,7 +283,8 @@ function loadFolders() {
                 default: {
                     id: process.env.DEFAULT_FOLDER_ID,
                     addedBy: 'system',
-                    addedAt: Date.now()
+                    addedAt: Date.now(),
+                    isGlobal: true
                 }
             };
             saveFolders(folders);
@@ -315,10 +354,11 @@ async function playAudio(fileId, fileName, channel) {
 
         const embed = new EmbedBuilder()
             .setColor('#00FF00')
-            .setTitle('🎵 Now Playing')
+            .setTitle(`${CUSTOM_EMOJIS.MUSIC} Now Playing`)
             .setDescription(fileName)
             .addFields(
-                { name: 'Queue Position', value: `Current: ${queue.length + 1} songs remaining` }
+                { name: 'Queue Position', value: `Current: ${queue.length} songs remaining` },
+                { name: 'Loop', value: isLooping ? 'Enabled 🔄' : 'Disabled ➡️' }
             )
             .setFooter({ 
                 text: `</> JoY • ${getFormattedDateTime()}`,
@@ -334,557 +374,785 @@ async function playAudio(fileId, fileName, channel) {
             }
         }
 
-        // Send new message and add reaction controls
-        const message = await channel.send({ embeds: [embed] });
-        currentPlayingMessage = message;
-        
-        // Add reaction controls without showing count
-        await message.react(CONTROLS.PLAY).catch(console.error);
-        await Promise.all([
-            message.react(CONTROLS.PAUSE, { fetchReaction: false }),
-            message.react(CONTROLS.SKIP, { fetchReaction: false }),
-            message.react(CONTROLS.STOP, { fetchReaction: false })
-        ]).catch(console.error);
+        // Create components array
+        const components = createControlButtons(false);
+        const queueMenu = createQueueSelectMenu();
+        if (queueMenu) {
+            components.push(queueMenu);
+        }
+
+        // Create and send new message with buttons
+        currentPlayingMessage = await channel.send({
+            embeds: [embed],
+            components: components
+        });
     } catch (error) {
         console.error('Error playing file:', error);
-        await channel.send('Error playing the file.').catch(console.error);
+        const errorEmbed = new EmbedBuilder()
+            .setColor('#FF0000')
+            .setTitle(`${CUSTOM_EMOJIS.ERROR} Error`)
+            .setDescription('Error playing the file.')
+            .setFooter({ 
+                text: `</> JoY • ${getFormattedDateTime()}`,
+                iconURL: client.user.displayAvatarURL()
+            });
+        await channel.send({ embeds: [errorEmbed] }).catch(console.error);
     }
 }
 
-// Handle slash commands
-client.on('interactionCreate', async interaction => {
-    if (!interaction.isChatInputCommand() && !interaction.isStringSelectMenu()) return;
+// Function to generate stats embeds
+function generateStatsEmbed(category) {
+    const totalMemory = os.totalmem();
+    const freeMemory = os.freemem();
+    const usedMemory = totalMemory - freeMemory;
+    const cpus = os.cpus();
+    const cpuModel = cpus[0].model;
+    const cpuSpeed = cpus[0].speed;
+    const platform = os.platform();
+    const arch = os.arch();
+    
+    // Calculate average CPU usage
+    const cpuUsage = cpus.reduce((acc, cpu) => {
+        const total = Object.values(cpu.times).reduce((a, b) => a + b);
+        const idle = cpu.times.idle;
+        return acc + ((total - idle) / total) * 100;
+    }, 0) / cpus.length;
 
-    try {
-        // Handle select menu interactions
-        if (interaction.isStringSelectMenu()) {
-            if (interaction.customId === 'folder_select') {
-                const folderName = interaction.values[0];
-                await handlePlayCommand(interaction, folderName);
+    // Get bot statistics
+    const totalGuilds = client.guilds.cache.size;
+    const totalMembers = client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0);
+    const totalChannels = client.channels.cache.size;
+    const shardPing = client.ws.ping;
+    
+    // Get voice connection statistics
+    const activeConnections = client.voice.adapters.size;
+    const totalVoiceChannels = client.channels.cache.filter(c => c.type === 2).size;
+
+    // Define all stat fields
+    const statFields = {
+        bot: { 
+            name: '🤖 Bot Info',
+            value: [
+                `**Discord.js:** v${discordJSVersion}`,
+                `**Node.js:** ${process.version}`,
+                `**Uptime:** ${formatUptime(client.uptime)}`,
+                `**WebSocket Ping:** ${shardPing}ms`
+            ].join('\n')
+        },
+        global: {
+            name: '🌐 Global Statistics',
+            value: [
+                `**Servers:** ${totalGuilds}`,
+                `**Total Members:** ${totalMembers}`,
+                `**Total Channels:** ${totalChannels}`,
+                `**Voice Channels:** ${totalVoiceChannels}`
+            ].join('\n')
+        },
+        music: {
+            name: '🎵 Music Stats',
+            value: [
+                `**Queue Length:** ${queue.length} songs`,
+                `**Player Status:** ${player.state.status}`,
+                `**Loop Mode:** ${isLooping ? 'Enabled' : 'Disabled'}`,
+                `**Active Voice Connections:** ${activeConnections}`,
+                `**Previous Songs:** ${previousSongs.length}`
+            ].join('\n')
+        },
+        host: {
+            name: '💻 Host Device Info',
+            value: [
+                `**OS:** ${platform} ${arch}`,
+                `**CPU:** ${cpuModel}`,
+                `**CPU Speed:** ${cpuSpeed}MHz`,
+                `**CPU Usage:** ${cpuUsage.toFixed(2)}%`,
+                `**CPU Cores:** ${cpus.length}`
+            ].join('\n')
+        },
+        memory: {
+            name: '💾 Memory Usage',
+            value: [
+                `**Total RAM:** ${formatBytes(totalMemory)}`,
+                `**Used RAM:** ${formatBytes(usedMemory)} (${((usedMemory / totalMemory) * 100).toFixed(2)}%)`,
+                `**Free RAM:** ${formatBytes(freeMemory)}`,
+                `**Process Memory:** ${formatBytes(process.memoryUsage().heapUsed)}`
+            ].join('\n')
+        },
+        process: {
+            name: '⚡ Process Info',
+            value: [
+                `**Process ID:** ${process.pid}`,
+                `**Process Platform:** ${process.platform}`,
+                `**Process Version:** ${process.version}`,
+                `**Process Uptime:** ${formatUptime(process.uptime() * 1000)}`
+            ].join('\n')
+        }
+    };
+
+    const embed = new EmbedBuilder()
+        .setColor('#00FF00')
+        .setTitle(`${CUSTOM_EMOJIS.INFO} Bot Statistics${category !== 'overview' ? ` - ${statFields[category].name}` : ''}`);
+
+    if (category === 'overview') {
+        embed.addFields(Object.values(statFields));
+    } else {
+        embed.addFields(statFields[category]);
+    }
+
+    embed.setFooter({ 
+        text: `</> JoY • ${getFormattedDateTime()}`,
+        iconURL: client.user.displayAvatarURL()
+    });
+
+    return embed;
+}
+
+// Function to create stats select menu
+function createStatsSelectMenu(selectedCategory = 'overview') {
+    return new StringSelectMenuBuilder()
+        .setCustomId('stats_category')
+        .setPlaceholder('Select a category to view')
+        .addOptions([
+            {
+                label: 'Overview',
+                description: 'Show all statistics',
+                value: 'overview',
+                emoji: '📊',
+                default: selectedCategory === 'overview'
+            },
+            {
+                label: 'Bot Info',
+                description: 'Basic bot information',
+                value: 'bot',
+                emoji: '🤖',
+                default: selectedCategory === 'bot'
+            },
+            {
+                label: 'Global Stats',
+                description: 'Server and member statistics',
+                value: 'global',
+                emoji: '🌐',
+                default: selectedCategory === 'global'
+            },
+            {
+                label: 'Music Stats',
+                description: 'Music player information',
+                value: 'music',
+                emoji: '🎵',
+                default: selectedCategory === 'music'
+            },
+            {
+                label: 'Host Info',
+                description: 'Host device information',
+                value: 'host',
+                emoji: '💻',
+                default: selectedCategory === 'host'
+            },
+            {
+                label: 'Memory Usage',
+                description: 'RAM and memory statistics',
+                value: 'memory',
+                emoji: '💾',
+                default: selectedCategory === 'memory'
+            },
+            {
+                label: 'Process Info',
+                description: 'Process information',
+                value: 'process',
+                emoji: '⚡',
+                default: selectedCategory === 'process'
             }
-            else if (interaction.customId === 'help_category') {
-                await handleHelpCategory(interaction);
+        ]);
+}
+
+// Handle all interactions (slash commands, buttons, and select menus)
+client.on('interactionCreate', async interaction => {
+    try {
+        // Handle slash commands
+        if (interaction.isChatInputCommand()) {
+            switch (interaction.commandName) {
+                case 'join': {
+                    await interaction.deferReply();
+                    const voiceChannel = interaction.member.voice.channel;
+                    
+                    if (!voiceChannel) {
+                        await interaction.editReply('Please join a voice channel first!');
+                        return;
+                    }
+
+                    try {
+                        // Check for existing connection and destroy it
+                        const existingConnection = getVoiceConnection(interaction.guildId);
+                        if (existingConnection) {
+                            existingConnection.destroy();
+                        }
+
+                        // Create new connection
+                        connection = joinVoiceChannel({
+                            channelId: voiceChannel.id,
+                            guildId: voiceChannel.guild.id,
+                            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+                            selfDeaf: false
+                        });
+
+                        // Set up connection state handlers
+                        connection.on(VoiceConnectionStatus.Ready, () => {
+                            console.log('Voice Connection is ready!');
+                        });
+
+                        connection.on(VoiceConnectionStatus.Disconnected, async () => {
+                            try {
+                                await Promise.race([
+                                    entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+                                    entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+                                ]);
+                            } catch (error) {
+                                connection.destroy();
+                            }
+                        });
+
+                        // Wait for connection to be ready
+                        await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+                        connection.subscribe(player);
+                        currentChannel = interaction.channel;
+                        
+                        await interaction.editReply('Successfully joined the voice channel!');
+                    } catch (error) {
+                        console.error('Error joining voice channel:', error);
+                        connection?.destroy();
+                        await interaction.editReply('Failed to join voice channel. Please try again.');
+                    }
+                    break;
+                }
+
+                case 'play': {
+                    await interaction.deferReply({ ephemeral: true });
+                    
+                    if (!connection) {
+                        await interaction.editReply('Use /join first!');
+                        return;
+                    }
+
+                    const folders = loadFolders();
+                    
+                    if (Object.keys(folders).length === 0) {
+                        await interaction.editReply('No folders available. Please add a folder using /addfolder command.');
+                        return;
+                    }
+
+                    try {
+                        const select = new StringSelectMenuBuilder()
+                            .setCustomId('folder_select')
+                            .setPlaceholder('Choose a folder to play from')
+                            .setMinValues(1)
+                            .setMaxValues(1);
+
+                        Object.entries(folders).forEach(([folderName, folderData]) => {
+                            select.addOptions({
+                                label: folderName,
+                                description: `Added by ${folderData.addedBy ? `<@${folderData.addedBy}>` : 'Unknown'}`,
+                                value: folderName,
+                                emoji: '📁'
+                            });
+                        });
+
+                        const row = new ActionRowBuilder().addComponents(select);
+
+                        const embed = new EmbedBuilder()
+                            .setColor('#00FF00')
+                            .setTitle(`${CUSTOM_EMOJIS.MUSIC} Select Music Folder`)
+                            .setDescription('Choose a folder to play music from:')
+                            .addFields(
+                                { name: 'Requested By', value: `<@${interaction.user.id}>` }
+                            )
+                            .setFooter({ 
+                                text: `</> JoY • ${getFormattedDateTime()}`,
+                                iconURL: client.user.displayAvatarURL()
+                            });
+
+                        await interaction.editReply({
+                            embeds: [embed],
+                            components: [row]
+                        });
+                    } catch (error) {
+                        console.error('Error creating folder selection menu:', error);
+                        await interaction.editReply('An error occurred while creating the folder selection menu.');
+                    }
+                    break;
+                }
+
+                case 'addfolder': {
+                    await interaction.deferReply({ ephemeral: true });
+                    
+                    const userId = interaction.user.id;
+                    const isOwner = userId === '1067394668687536160';
+                    
+                    // Check cooldown only for non-owner users
+                    if (!isOwner) {
+                        const cooldownStatus = checkCooldown(userId);
+                        if (cooldownStatus.onCooldown) {
+                            const embed = new EmbedBuilder()
+                                .setColor('#FF0000')
+                                .setTitle(`${CUSTOM_EMOJIS.ERROR} Cooldown Active`)
+                                .setDescription(`You can add another folder in: ${cooldownStatus.timeLeft}`)
+                                .setFooter({ 
+                                    text: `</> JoY • ${getFormattedDateTime()}`,
+                                    iconURL: client.user.displayAvatarURL()
+                                });
+                            
+                            await interaction.editReply({ embeds: [embed] });
+                            return;
+                        }
+                    }
+
+                    const name = interaction.options.getString('name');
+                    const folderId = interaction.options.getString('id');
+                    const makeGlobal = interaction.options.getBoolean('global') || false;
+                    
+                    const folders = loadFolders();
+                    if (folders[name]) {
+                        await interaction.editReply(`A folder with the name "${name}" already exists!`);
+                        return;
+                    }
+
+                    try {
+                        const testLoad = await loadSongsFromDrive(folderId);
+                        if (testLoad.length === 0) {
+                            await interaction.editReply('No audio files found in this folder. Make sure the folder ID is correct and contains audio files.');
+                            return;
+                        }
+
+                        folders[name] = {
+                            id: folderId,
+                            addedBy: userId,
+                            addedAt: Date.now(),
+                            isGlobal: makeGlobal
+                        };
+                        saveFolders(folders);
+
+                        // Set cooldown only for non-owner users
+                        if (!isOwner) {
+                            userCooldowns.set(userId, {
+                                timestamp: Date.now(),
+                                folderName: name
+                            });
+                        }
+
+                        const embed = new EmbedBuilder()
+                            .setColor('#00FF00')
+                            .setTitle(`${CUSTOM_EMOJIS.SUCCESS} Folder Added Successfully`)
+                            .setDescription(`Folder "${name}" has been added with ${testLoad.length} songs!`)
+                            .addFields(
+                                { name: 'Folder Name', value: name },
+                                { name: 'Number of Songs', value: testLoad.length.toString() },
+                                { name: 'Added By', value: `<@${interaction.user.id}>` },
+                                { name: 'Visibility', value: makeGlobal ? '🌐 Global' : '🔒 Private' },
+                                { name: 'Next Folder Add', value: isOwner ? 'No cooldown (Bot Owner)' : '7 days from now' }
+                            )
+                            .setFooter({ 
+                                text: `</> JoY • ${getFormattedDateTime()}`,
+                                iconURL: client.user.displayAvatarURL()
+                            });
+
+                        await interaction.editReply({ embeds: [embed] });
+                    } catch (error) {
+                        console.error('Error accessing folder:', error);
+                        await interaction.editReply('Error accessing the folder. Make sure the folder ID is correct and the folder is shared with the bot\'s service account.');
+                    }
+                    break;
+                }
+
+                case 'removefolder': {
+                    const name = interaction.options.getString('name');
+                    const userId = interaction.user.id;
+                    const folders = loadFolders();
+                    
+                    if (!folders[name]) {
+                        await interaction.reply({
+                            content: `No folder found with the name "${name}"`,
+                            ephemeral: true
+                        });
+                        return;
+                    }
+
+                    // Check if user has permission to remove the folder
+                    if (folders[name].addedBy !== userId && userId !== '1067394668687536160') {
+                        await interaction.reply({
+                            content: `${CUSTOM_EMOJIS.ERROR} You can only remove folders that you added!`,
+                            ephemeral: true
+                        });
+                        return;
+                    }
+
+                    delete folders[name];
+                    saveFolders(folders);
+
+                    const embed = new EmbedBuilder()
+                        .setColor('#00FF00')
+                        .setTitle(`${CUSTOM_EMOJIS.SUCCESS} Folder Removed`)
+                        .setDescription(`Successfully removed folder "${name}"`)
+                        .addFields(
+                            { name: 'Removed By', value: `<@${interaction.user.id}>` }
+                        )
+                        .setFooter({ 
+                            text: `</> JoY • ${getFormattedDateTime()}`,
+                            iconURL: client.user.displayAvatarURL()
+                        });
+
+                    await interaction.reply({
+                        embeds: [embed],
+                        ephemeral: true
+                    });
+                    break;
+                }
+
+                case 'listfolders': {
+                    const folders = loadFolders();
+                    const userId = interaction.user.id;
+                    const isOwner = userId === '1067394668687536160';
+                    
+                    // For bot owner, show all folders. For others, filter accessible folders
+                    const accessibleFolders = isOwner 
+                        ? Object.entries(folders)
+                        : Object.entries(folders).filter(([_, folder]) => 
+                            folder.isGlobal || folder.addedBy === userId
+                        );
+                    
+                    if (accessibleFolders.length === 0) {
+                        await interaction.reply({
+                            content: 'No folders available. Use /addfolder to add a folder.',
+                            ephemeral: true
+                        });
+                        return;
+                    }
+
+                    const embed = new EmbedBuilder()
+                        .setColor('#00FF00')
+                        .setTitle(`${CUSTOM_EMOJIS.INFO} ${isOwner ? 'All' : 'Available'} Folders`)
+                        .setDescription(accessibleFolders.map(([name, folder]) => {
+                            const visibility = folder.isGlobal ? '🌐' : '🔒';
+                            const ownerInfo = folder.addedBy === 'system' 
+                                ? 'System' 
+                                : `<@${folder.addedBy}>`;
+                            const addedDate = new Date(folder.addedAt).toLocaleDateString();
+                            return `• ${name} ${visibility}\n  ┗ Added by: ${ownerInfo}\n  ┗ Added on: ${addedDate}`;
+                        }).join('\n\n'))
+                        .addFields(
+                            { 
+                                name: 'Legend', 
+                                value: '🌐 - Global Folder\n🔒 - Private Folder' 
+                            },
+                            { 
+                                name: 'Total Folders', 
+                                value: `${accessibleFolders.length} folder${accessibleFolders.length !== 1 ? 's' : ''}` 
+                            },
+                            {
+                                name: 'View Mode',
+                                value: isOwner ? '👑 Owner (All Folders)' : '👤 User (Accessible Folders)'
+                            }
+                        )
+                        .setFooter({ 
+                            text: `</> JoY • ${getFormattedDateTime()}`,
+                            iconURL: client.user.displayAvatarURL()
+                        });
+
+                    await interaction.reply({
+                        embeds: [embed],
+                        ephemeral: true
+                    });
+                    break;
+                }
+
+                case 'help': {
+                    const embed = new EmbedBuilder()
+                        .setColor('#00FF00')
+                        .setTitle(`${CUSTOM_EMOJIS.INFO} Bot Commands`)
+                        .addFields(
+                            {
+                                name: '🎵 Music Commands',
+                                value: [
+                                    '`/join` - Join your voice channel',
+                                    '`/play` - Choose and play music from folders',
+                                    'Use the music control buttons to:',
+                                    '• Play/Pause music',
+                                    '• Skip to next song',
+                                    '• Go to previous song',
+                                    '• Toggle loop mode',
+                                    '• View and select from queue'
+                                ].join('\n')
+                            },
+                            {
+                                name: '📁 Folder Management',
+                                value: [
+                                    '`/addfolder <name> <id>` - Add a new folder',
+                                    '`/removefolder <name>` - Remove a folder',
+                                    '`/listfolders` - Show all folders'
+                                ].join('\n')
+                            }
+                        )
+                        .setFooter({ 
+                            text: `</> JoY • ${getFormattedDateTime()}`,
+                            iconURL: client.user.displayAvatarURL()
+                        });
+
+                    await interaction.reply({
+                        embeds: [embed],
+                        ephemeral: true
+                    });
+                    break;
+                }
+
+                case 'stats': {
+                    try {
+                        const row = new ActionRowBuilder().addComponents(createStatsSelectMenu());
+                        await interaction.reply({
+                            embeds: [generateStatsEmbed('overview')],
+                            components: [row],
+                            ephemeral: true
+                        });
+                    } catch (error) {
+                        console.error('Error in stats command:', error);
+                        await interaction.reply({
+                            content: `${CUSTOM_EMOJIS.ERROR} Failed to get statistics. Please try again.`,
+                            ephemeral: true
+                        });
+                    }
+                    break;
+                }
             }
             return;
         }
 
-        // Handle slash commands
-        switch (interaction.commandName) {
-            case 'addfolder': {
-                await interaction.deferReply({ ephemeral: true });
-                
-                const userId = interaction.user.id;
-                
-                // Check cooldown
-                const cooldownStatus = checkCooldown(userId);
-                if (cooldownStatus.onCooldown) {
-                    const embed = new EmbedBuilder()
-                        .setColor('#FF0000')
-                        .setTitle('❌ Cooldown Active')
-                        .setDescription(`You can add another folder in: ${cooldownStatus.timeLeft}`)
-                        .setFooter({ 
-                            text: `</> JoY • ${getFormattedDateTime()}`,
-                            iconURL: client.user.displayAvatarURL()
-                        });
+        // Handle select menu interactions
+        if (interaction.isStringSelectMenu()) {
+            if (interaction.customId === 'folder_select') {
+                await handlePlayCommand(interaction, interaction.values[0]);
+            }
+            else if (interaction.customId === 'stats_category') {
+                try {
+                    const category = interaction.values[0];
+                    const row = new ActionRowBuilder().addComponents(createStatsSelectMenu(category));
                     
-                    await interaction.editReply({
-                        embeds: [embed],
+                    await interaction.update({
+                        embeds: [generateStatsEmbed(category)],
+                        components: [row]
+                    });
+                } catch (error) {
+                    console.error('Error updating stats:', error);
+                    await interaction.followUp({
+                        content: `${CUSTOM_EMOJIS.ERROR} Failed to update statistics. Please try again.`,
                         ephemeral: true
                     });
-                    return;
                 }
-
-                const name = interaction.options.getString('name');
-                const folderId = interaction.options.getString('id');
-                
-                const folders = loadFolders();
-                if (folders[name]) {
-                    await interaction.editReply(`A folder with the name "${name}" already exists!`);
-                    return;
-                }
-
-                // Verify the folder exists and is accessible
+            }
+            else if (interaction.customId === 'song_select') {
                 try {
-                    const testLoad = await loadSongsFromDrive(folderId);
-                    if (testLoad.length === 0) {
-                        await interaction.editReply('No audio files found in this folder. Make sure the folder ID is correct and contains audio files.');
+                    const selectedIndex = parseInt(interaction.values[0]);
+                    if (!isNaN(selectedIndex) && selectedIndex < queue.length) {
+                        // Get the selected song and make a copy of it
+                        const selectedSong = { ...queue[selectedIndex] };
+                        
+                        // Remove the selected song from its current position
+                        queue.splice(selectedIndex, 1);
+                        
+                        // If there's a current song, add it back to the front of the queue
+                        if (currentSong) {
+                            previousSongs.push(currentSong);
+                            // Keep only the last 50 previous songs
+                            if (previousSongs.length > 50) {
+                                previousSongs.shift();
+                            }
+                        }
+
+                        // Stop current playback and play the selected song
+                        skipInProgress = true;
+                        player.stop();
+                        
+                        // Play the selected song
+                        await playAudio(selectedSong.id, selectedSong.name, interaction.channel);
+                        
+                        // Update interaction with confirmation
+                        await interaction.update({
+                            content: `${CUSTOM_EMOJIS.MUSIC} Now playing: ${selectedSong.name}`,
+                            components: [createQueueSelectMenu()]
+                        });
+                    } else {
+                        await interaction.update({
+                            content: `${CUSTOM_EMOJIS.ERROR} Invalid song selection!`,
+                            components: [createQueueSelectMenu()]
+                        });
+                    }
+                } catch (error) {
+                    console.error('Error in song selection:', error);
+                    await interaction.update({
+                        content: `${CUSTOM_EMOJIS.ERROR} Error playing selected song!`,
+                        components: [createQueueSelectMenu()]
+                    });
+                }
+            }
+            return;
+        }
+
+        // Handle button interactions
+        if (interaction.isButton()) {
+            switch (interaction.customId) {
+                case 'previous':
+                    if (previousSongs.length > 0) {
+                        const previousSong = previousSongs.pop();
+                        if (currentSong) {
+                            // Add current song to the front of the queue
+                            queue.unshift(currentSong);
+                        }
+                        // Stop current playback
+                        player.stop();
+                        skipInProgress = true;
+                        // Play the previous song
+                        await playAudio(previousSong.id, previousSong.name, interaction.channel);
+                        await interaction.reply({ 
+                            content: `${CUSTOM_EMOJIS.PREVIOUS} Playing previous song: ${previousSong.name}`,
+                            ephemeral: true 
+                        });
+                    } else {
+                        await interaction.reply({ 
+                            content: `${CUSTOM_EMOJIS.ERROR} No previous songs available!`,
+                            ephemeral: true 
+                        });
+                    }
+                    break;
+
+                case 'pause':
+                    if (player.state.status === AudioPlayerStatus.Playing) {
+                        player.pause();
+                        await updateNowPlayingMessage(interaction.channel);
+                        await interaction.reply({ 
+                            content: `${CUSTOM_EMOJIS.PAUSE} Paused playback`,
+                            ephemeral: true 
+                        });
+                    }
+                    break;
+
+                case 'resume':
+                    if (player.state.status === AudioPlayerStatus.Paused) {
+                        player.unpause();
+                        await updateNowPlayingMessage(interaction.channel);
+                        await interaction.reply({ 
+                            content: `${CUSTOM_EMOJIS.PLAY} Resumed playback`,
+                            ephemeral: true 
+                        });
+                    }
+                    break;
+
+                case 'skip':
+                    if (isProcessingSkip) {
+                        await interaction.reply({
+                            content: `${CUSTOM_EMOJIS.WARNING} Please wait 5 seconds between skips`,
+                            ephemeral: true
+                        });
                         return;
                     }
 
-                    // Add folder and save
-                    folders[name] = {
-                        id: folderId,
-                        addedBy: userId,
-                        addedAt: Date.now()
-                    };
-                    saveFolders(folders);
+                    if (currentSong && !skipInProgress) {
+                        isProcessingSkip = true;
+                        skipInProgress = true;
 
-                    // Set cooldown
-                    userCooldowns.set(userId, {
-                        timestamp: Date.now(),
-                        folderName: name
-                    });
-
-                    // Create embed with folder info
-                    const embed = new EmbedBuilder()
-                        .setColor('#00FF00')
-                        .setTitle('📁 Folder Added Successfully')
-                        .setDescription(`Folder "${name}" has been added with ${testLoad.length} songs!`)
-                        .addFields(
-                            { name: 'Folder Name', value: name },
-                            { name: 'Number of Songs', value: testLoad.length.toString() },
-                            { name: 'Added By', value: `<@${interaction.user.id}>` },
-                            { name: 'Next Folder Add', value: '7 days from now' }
-                        )
-                        .setFooter({ 
-                            text: `</> JoY • ${getFormattedDateTime()}`,
-                            iconURL: client.user.displayAvatarURL()
-                        });
-
-                    await interaction.editReply({
-                        embeds: [embed],
-                        ephemeral: true
-                    });
-                } catch (error) {
-                    console.error('Error accessing folder:', error);
-                    await interaction.editReply('Error accessing the folder. Make sure the folder ID is correct and the folder is shared with the bot\'s service account.');
-                }
-                break;
-            }
-
-            case 'removefolder': {
-                // Check if the user is the bot owner
-                if (interaction.user.id !== '1067394668687536160') {
-                    await interaction.reply({
-                        content: '❌ Only the bot owner can remove folders!',
-                        ephemeral: true
-                    });
-                    return;
-                }
-
-                const name = interaction.options.getString('name');
-                const folders = loadFolders();
-                
-                if (!folders[name]) {
-                    await interaction.reply({
-                        content: `No folder found with the name "${name}"`,
-                        ephemeral: true
-                    });
-                    return;
-                }
-
-                delete folders[name];
-                saveFolders(folders);
-
-                // Create embed for successful removal
-                const embed = new EmbedBuilder()
-                    .setColor('#00FF00')
-                    .setTitle('📁 Folder Removed')
-                    .setDescription(`Successfully removed folder "${name}"`)
-                    .addFields(
-                        { name: 'Removed By', value: `<@${interaction.user.id}>` }
-                    )
-                    .setFooter({ 
-                        text: `</> JoY • ${getFormattedDateTime()}`,
-                        iconURL: client.user.displayAvatarURL()
-                    });
-
-                await interaction.reply({
-                    embeds: [embed],
-                    ephemeral: true
-                });
-                break;
-            }
-
-            case 'listfolders': {
-                const folders = loadFolders();
-                const folderList = Object.keys(folders);
-                
-                if (folderList.length === 0) {
-                    await interaction.reply('No folders have been added yet. Use /addfolder to add a folder.');
-                    return;
-                }
-
-                const embed = new EmbedBuilder()
-                    .setColor('#00FF00')
-                    .setTitle('📁 Available Folders')
-                    .setDescription(folderList.map(name => `• ${name}`).join('\n'))
-                    .addFields(
-                        { name: 'Requested By', value: `<@${interaction.user.id}>` }
-                    )
-                    .setFooter({ 
-                        text: `</> JoY • ${getFormattedDateTime()}`,
-                        iconURL: client.user.displayAvatarURL()
-                    });
-
-                await interaction.reply({
-                    embeds: [embed],
-                    ephemeral: true
-                });
-                break;
-            }
-
-            case 'join': {
-                await interaction.deferReply();
-                const voiceChannel = interaction.member.voice.channel;
-                
-                if (!voiceChannel) {
-                    await interaction.editReply('Please join a voice channel first!');
-                    return;
-                }
-
-                try {
-                    // Check for existing connection and destroy it
-                    const existingConnection = getVoiceConnection(interaction.guildId);
-                    if (existingConnection) {
-                        existingConnection.destroy();
-                    }
-
-                    // Create new connection
-                    connection = joinVoiceChannel({
-                        channelId: voiceChannel.id,
-                        guildId: voiceChannel.guild.id,
-                        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-                        selfDeaf: false
-                    });
-
-                    // Set up connection state handlers
-                    connection.on(VoiceConnectionStatus.Ready, () => {
-                        console.log('Voice Connection is ready!');
-                    });
-
-                    connection.on(VoiceConnectionStatus.Disconnected, async () => {
-                        try {
-                            await Promise.race([
-                                entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-                                entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-                            ]);
-                        } catch (error) {
-                            connection.destroy();
-                        }
-                    });
-
-                    // Wait for connection to be ready
-                    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-                    connection.subscribe(player);
-                    currentChannel = interaction.channel;
-                    
-                    await interaction.editReply('Successfully joined the voice channel!');
-                } catch (error) {
-                    console.error('Error joining voice channel:', error);
-                    connection?.destroy();
-                    await interaction.editReply('Failed to join voice channel. Please try again.');
-                }
-                break;
-            }
-
-            case 'play': {
-                await interaction.deferReply({ ephemeral: true });
-                
-                if (!connection) {
-                    await interaction.editReply({
-                        content: 'Use /join first!',
-                        ephemeral: true
-                    });
-                    return;
-                }
-
-                const folders = loadFolders();
-                
-                // If no folders available at all
-                if (Object.keys(folders).length === 0) {
-                    await interaction.editReply('No folders available. Please add a folder using /addfolder command.');
-                    return;
-                }
-
-                try {
-                    // Create select menu
-                    const select = new StringSelectMenuBuilder()
-                        .setCustomId('folder_select')
-                        .setPlaceholder('Choose a folder to play from')
-                        .setMinValues(1)
-                        .setMaxValues(1);
-
-                    // Add options to the select menu
-                    Object.entries(folders).forEach(([folderName, folderData]) => {
-                        select.addOptions({
-                            label: folderName,
-                            description: `Added by ${folderData.addedBy ? `<@${folderData.addedBy}>` : 'Unknown'}`,
-                            value: folderName,
-                            emoji: '📁'
-                        });
-                    });
-
-                    // Create action row with the select menu
-                    const row = new ActionRowBuilder()
-                        .addComponents(select);
-
-                    const embed = new EmbedBuilder()
-                        .setColor('#00FF00')
-                        .setTitle('🎵 Select Music Folder')
-                        .setDescription('Choose a folder to play music from:')
-                        .addFields(
-                            { name: 'Requested By', value: `<@${interaction.user.id}>` }
-                        )
-                        .setFooter({ 
-                            text: `</> JoY • ${getFormattedDateTime()}`,
-                            iconURL: client.user.displayAvatarURL()
-                        });
-
-                    await interaction.editReply({
-                        embeds: [embed],
-                        components: [row],
-                        ephemeral: true
-                    });
-                } catch (error) {
-                    console.error('Error creating folder selection menu:', error);
-                    await interaction.editReply('An error occurred while creating the folder selection menu.');
-                }
-                break;
-            }
-
-            case 'skip': {
-                await interaction.deferReply();
-                
-                if (!currentSong) {
-                    await interaction.editReply('Nothing is playing!');
-                    setTimeout(() => interaction.deleteReply().catch(console.error), 1000);
-                    return;
-                }
-
-                player.stop();
-                await interaction.editReply('Skipping current song...');
-                setTimeout(() => interaction.deleteReply().catch(console.error), 1000);
-                
-                if (queue.length > 0) {
-                    const nextSong = queue[0];
-                    queue = queue.slice(1);
-                    await playAudio(nextSong.id, nextSong.name, interaction.channel);
-                }
-                break;
-            }
-
-            case 'pause': {
-                await interaction.deferReply();
-                
-                if (!player) {
-                    await interaction.editReply('Nothing is playing!');
-                    setTimeout(() => interaction.deleteReply().catch(console.error), 1000);
-                    return;
-                }
-                
-                player.pause();
-                await interaction.editReply('Paused the music!');
-                setTimeout(() => interaction.deleteReply().catch(console.error), 1000);
-                break;
-            }
-
-            case 'resume': {
-                await interaction.deferReply();
-                
-                if (!player) {
-                    await interaction.editReply('Nothing is playing!');
-                    setTimeout(() => interaction.deleteReply().catch(console.error), 1000);
-                    return;
-                }
-                
-                player.unpause();
-                await interaction.editReply('Resumed the music!');
-                setTimeout(() => interaction.deleteReply().catch(console.error), 1000);
-                break;
-            }
-
-            case 'stats': {
-                try {
-                    // Get server info
-                    const server = interaction.guild;
-                    const textChannels = server.channels.cache.filter(c => c.type === 0).size;
-                    const voiceChannels = server.channels.cache.filter(c => c.type === 2).size;
-                    const categories = server.channels.cache.filter(c => c.type === 4).size;
-                    
-                    // Get system info
-                    const totalMem = os.totalmem();
-                    const freeMem = os.freemem();
-                    const usedMem = totalMem - freeMem;
-                    const memoryUsage = process.memoryUsage();
-                    
-                    // Create embed
-                    const embed = new EmbedBuilder()
-                        .setColor('#00FF00')
-                        .setTitle('📊 Bot Statistics')
-                        .addFields(
-                            { 
-                                name: '🤖 Bot Info',
-                                value: [
-                                    `**Servers:** ${client.guilds.cache.size}`,
-                                    `**Ping:** ${Math.round(client.ws.ping)}ms`,
-                                    `**Uptime:** ${formatUptime(client.uptime)}`,
-                                    `**Discord.js:** v${discordJSVersion}`,
-                                    `**Node.js:** ${process.version}`
-                                ].join('\n'),
-                                inline: true
-                            },
-                            {
-                                name: '💻 System Info',
-                                value: [
-                                    `**Platform:** ${os.platform()}`,
-                                    `**CPU:** ${os.cpus()[0].model}`,
-                                    `**CPU Cores:** ${os.cpus().length}`,
-                                    `**Memory Usage:** ${formatBytes(usedMem)} / ${formatBytes(totalMem)}`,
-                                    `**Bot Memory:** ${formatBytes(memoryUsage.heapUsed)}`
-                                ].join('\n'),
-                                inline: true
-                            },
-                            {
-                                name: '🏠 Server Info',
-                                value: [
-                                    `**Name:** ${server.name}`,
-                                    `**Members:** ${server.memberCount}`,
-                                    `**Roles:** ${server.roles.cache.size}`,
-                                    `**Text Channels:** ${textChannels}`,
-                                    `**Voice Channels:** ${voiceChannels}`,
-                                    `**Categories:** ${categories}`
-                                ].join('\n'),
-                                inline: true
+                        // Add current song to previous songs array before stopping
+                        if (currentSong) {
+                            previousSongs.push(currentSong);
+                            // Keep only the last 50 previous songs
+                            if (previousSongs.length > 50) {
+                                previousSongs.shift();
                             }
-                        )
-                        .setThumbnail(server.iconURL({ size: 256, dynamic: true }))
+                        }
+
+                        // Stop current song
+                        player.stop();
+
+                        // Play next song if available
+                        if (queue.length > 0) {
+                            const nextSong = queue[0];
+                            queue = queue.slice(1);
+                            await playAudio(nextSong.id, nextSong.name, interaction.channel);
+                        } else {
+                            currentSong = null;
+                            skipInProgress = false;
+                            if (currentPlayingMessage) {
+                                await currentPlayingMessage.delete().catch(console.error);
+                                currentPlayingMessage = null;
+                            }
+                        }
+
+                        await interaction.reply({ 
+                            content: `${CUSTOM_EMOJIS.SKIP} Skipped current song`,
+                            ephemeral: true 
+                        });
+
+                        // Reset the skip processing flag after 5 seconds
+                        setTimeout(() => {
+                            isProcessingSkip = false;
+                        }, 5000);
+                    }
+                    break;
+
+                case 'stop':
+                    if (currentSong) {
+                        skipInProgress = true; // Prevent auto-play when stopping
+                        player.stop();
+                        queue = [];
+                        currentSong = null;
+                        await interaction.reply({ 
+                            content: `${CUSTOM_EMOJIS.STOP} Stopped playback and cleared queue`,
+                            ephemeral: true 
+                        });
+                    }
+                    break;
+
+                case 'loop':
+                    isLooping = !isLooping;
+                    await updateNowPlayingMessage(interaction.channel);
+                    await interaction.reply({ 
+                        content: `${CUSTOM_EMOJIS.LOOP} Loop mode ${isLooping ? 'enabled' : 'disabled'}`,
+                        ephemeral: true 
+                    });
+                    break;
+
+                case 'queue':
+                    if (queue.length === 0) {
+                        await interaction.reply({ 
+                            content: `${CUSTOM_EMOJIS.QUEUE} Queue is empty`,
+                            ephemeral: true 
+                        });
+                        return;
+                    }
+
+                    const queueEmbed = new EmbedBuilder()
+                        .setColor('#00FF00')
+                        .setTitle(`${CUSTOM_EMOJIS.QUEUE} Current Queue`)
+                        .setDescription(queue.slice(0, 10).map((song, index) => 
+                            `${index + 1}. ${song.name}`
+                        ).join('\n'))
                         .setFooter({ 
-                            text: `</> JoY • ${getFormattedDateTime()}`,
+                            text: `Total songs in queue: ${queue.length}`,
                             iconURL: client.user.displayAvatarURL()
                         });
 
-                    // Create dismiss button
-                    const dismissButton = new ButtonBuilder()
-                        .setCustomId(DISMISS_BUTTON_ID)
-                        .setLabel('Dismiss')
-                        .setStyle(ButtonStyle.Secondary)
-                        .setEmoji('🗑️');
-
-                    const row = new ActionRowBuilder().addComponents(dismissButton);
-
-                    // Send as ephemeral message using flags
-                    await interaction.reply({
-                        embeds: [embed],
-                        components: [row],
-                        ephemeral: true
-                    });
-
-                    // Set up channel leave listener for this specific message
-                    const collector = interaction.channel.createMessageComponentCollector({
-                        filter: i => i.customId === DISMISS_BUTTON_ID && i.user.id === interaction.user.id,
-                        time: 300000 // 5 minutes
-                    });
-
-                    collector.on('collect', async i => {
-                        if (i.customId === DISMISS_BUTTON_ID) {
-                            await i.update({ content: 'Message dismissed!', embeds: [], components: [], ephemeral: true });
-                            setTimeout(() => i.deleteReply().catch(console.error), 1000);
-                        }
-                    });
-
-                } catch (error) {
-                    console.error('Error getting stats:', error);
                     await interaction.reply({ 
-                        content: 'An error occurred while fetching statistics.',
-                        ephemeral: true
+                        embeds: [queueEmbed],
+                        ephemeral: true 
                     });
-                }
-                break;
+                    break;
             }
-
-            case 'help': {
-                // Create the initial help embed
-                const embed = createOverviewEmbed(client);
-
-                // Create select menu for categories
-                const select = new StringSelectMenuBuilder()
-                    .setCustomId('help_category')
-                    .setPlaceholder('Choose a command category')
-                    .addOptions([
-                        {
-                            label: 'Overview',
-                            description: 'Show all commands',
-                            value: 'overview',
-                            emoji: '📖',
-                            default: true
-                        },
-                        {
-                            label: 'Music Commands',
-                            description: 'Commands for playing music',
-                            value: 'music',
-                            emoji: '🎵'
-                        },
-                        {
-                            label: 'Folder Management',
-                            description: 'Commands for managing Google Drive folders',
-                            value: 'folder',
-                            emoji: '📁'
-                        },
-                        {
-                            label: 'Other Commands',
-                            description: 'Other utility commands',
-                            value: 'other',
-                            emoji: '🔧'
-                        },
-                        {
-                            label: 'Reaction Controls',
-                            description: 'Available reaction controls',
-                            value: 'reactions',
-                            emoji: '🎮'
-                        }
-                    ]);
-
-                const menuRow = new ActionRowBuilder().addComponents(select);
-
-                // Create dismiss button
-                const dismissButton = new ButtonBuilder()
-                    .setCustomId(DISMISS_BUTTON_ID)
-                    .setLabel('Dismiss')
-                    .setStyle(ButtonStyle.Secondary)
-                    .setEmoji('🗑️');
-
-                const buttonRow = new ActionRowBuilder().addComponents(dismissButton);
-
-                // Send as ephemeral message using flags
-                await interaction.reply({
-                    embeds: [embed],
-                    components: [menuRow, buttonRow],
-                    ephemeral: true
-                });
-
-                // Set up collectors for both the select menu and dismiss button
-                const collector = interaction.channel.createMessageComponentCollector({
-                    filter: i => (
-                        (i.customId === 'help_category' || i.customId === DISMISS_BUTTON_ID) && 
-                        i.user.id === interaction.user.id
-                    ),
-                    time: 300000 // 5 minutes
-                });
-
-                collector.on('collect', async i => {
-                    if (i.customId === DISMISS_BUTTON_ID) {
-                        await i.update({ content: 'Help dismissed!', embeds: [], components: [], ephemeral: true });
-                        setTimeout(() => i.deleteReply().catch(console.error), 1000);
-                    } else if (i.customId === 'help_category') {
-                        await handleHelpCategory(i);
-                    }
-                });
-
-                break;
-            }
+            return;
         }
     } catch (error) {
         console.error('Error handling interaction:', error);
         try {
-            const message = 'An error occurred while processing the command.';
+            const errorMessage = 'An error occurred while processing your request.';
             if (!interaction.replied && !interaction.deferred) {
                 await interaction.reply({ 
-                    content: message, 
+                    content: errorMessage, 
                     ephemeral: true 
                 });
             } else {
-                await interaction.editReply(message);
+                await interaction.editReply(errorMessage);
             }
         } catch (e) {
             console.error('Error sending error message:', e);
@@ -892,227 +1160,27 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// Add helper function to create overview embed
-function createOverviewEmbed(client) {
-    return new EmbedBuilder()
-        .setColor('#00FF00')
-        .setTitle('📖 Command Overview')
-        .setDescription('Here\'s a complete list of all available commands. Select a category from the dropdown menu below for detailed information.')
-        .addFields(
-            {
-                name: '🎵 Music Commands',
-                value: [
-                    '`/join` - Join your voice channel',
-                    '`/play` - Choose and play music from available folders',
-                    '`/pause` - Pause the current song',
-                    '`/resume` - Resume the paused song',
-                    '`/skip` - Skip to the next song'
-                ].join('\n'),
-                inline: true
-            },
-            {
-                name: '📁 Folder Management',
-                value: [
-                    '`/addfolder <name> <id>` - Add folder',
-                    '`/removefolder <name>` - Remove folder',
-                    '`/listfolders` - Show all folders'
-                ].join('\n'),
-                inline: true
-            },
-            {
-                name: '🔧 Other Commands',
-                value: [
-                    '`/stats` - Show statistics',
-                    '`/help` - Show this help'
-                ].join('\n'),
-                inline: true
-            },
-            {
-                name: '⚡ Quick Start',
-                value: [
-                    '1. Join a voice channel',
-                    '2. Use `/join` to bring the bot in',
-                    '3. Use `/play` to select a folder and start playing music',
-                    '4. Use reaction controls under the playing message'
-                ].join('\n')
-            },
-            {
-                name: '🎮 Reaction Controls',
-                value: [
-                    '▶️ - Resume playback',
-                    '⏸️ - Pause playback',
-                    '⏭️ - Skip current song',
-                    '⏹️ - Stop playback and clear queue'
-                ].join('\n')
-            }
-        )
-        .setThumbnail(client.user.displayAvatarURL())
-        .setFooter({ 
-            text: `</> JoY • ${getFormattedDateTime()}`,
-            iconURL: client.user.displayAvatarURL()
-        });
-}
-
-// Modify the handleHelpCategory function to include overview
-async function handleHelpCategory(interaction) {
-    const category = interaction.values[0];
-    let embed;
-
-    if (category === 'overview') {
-        embed = createOverviewEmbed(client);
-    } else {
-        embed = new EmbedBuilder()
-            .setColor('#00FF00')
-            .setThumbnail(client.user.displayAvatarURL())
-            .setFooter({ 
-                text: `</> JoY • ${getFormattedDateTime()}`,
-                iconURL: client.user.displayAvatarURL()
-            });
-
-        switch (category) {
-            case 'music':
-                embed
-                    .setTitle('🎵 Music Commands')
-                    .addFields({
-                        name: 'Available Commands',
-                        value: [
-                            '`/join` - Join your voice channel',
-                            '`/play` - Choose and play music from available folders',
-                            '`/pause` - Pause the current song',
-                            '`/resume` - Resume the paused song',
-                            '`/skip` - Skip to the next song'
-                        ].join('\n')
-                    })
-                    .addFields({
-                        name: 'How to Use',
-                        value: 'Join a voice channel first, then use `/join` to bring the bot in. Use `/play` to select a folder and start playing music.'
-                    });
-                break;
-
-            case 'folder':
-                embed
-                    .setTitle('📁 Folder Management')
-                    .addFields({
-                        name: 'Available Commands',
-                        value: [
-                            '`/addfolder <name> <id>` - Add a new Google Drive folder',
-                            '`/removefolder <name>` - Remove a folder',
-                            '`/listfolders` - Show all available folders'
-                        ].join('\n')
-                    })
-                    .addFields({
-                        name: 'How to get folder ID',
-                        value: 'Open your Google Drive folder and copy the ID from the URL:\n`https://drive.google.com/drive/folders/`**`YOUR_FOLDER_ID`**'
-                    });
-                break;
-
-            case 'other':
-                embed
-                    .setTitle('🔧 Other Commands')
-                    .addFields({
-                        name: 'Available Commands',
-                        value: [
-                            '`/stats` - Show bot and server statistics',
-                            '`/help` - Show this help message'
-                        ].join('\n')
-                    })
-                    .addFields({
-                        name: 'Additional Info',
-                        value: 'Use `/stats` to see detailed information about the bot, server, and system performance.'
-                    });
-                break;
-
-            case 'reactions':
-                embed
-                    .setTitle('🎮 Reaction Controls')
-                    .addFields({
-                        name: 'Available Controls',
-                        value: [
-                            '▶️ - Resume playback',
-                            '⏸️ - Pause playback',
-                            '⏭️ - Skip current song',
-                            '⏹️ - Stop playback and clear queue'
-                        ].join('\n')
-                    })
-                    .addFields({
-                        name: 'How to Use',
-                        value: 'Click on the reaction buttons below the currently playing song message to control playback.'
-                    });
-                break;
-        }
-    }
-
-    // Create dismiss button
-    const dismissButton = new ButtonBuilder()
-        .setCustomId(DISMISS_BUTTON_ID)
-        .setLabel('Dismiss')
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('🗑️');
-
-    const buttonRow = new ActionRowBuilder().addComponents(dismissButton);
-
-    // Keep the category select menu and add the dismiss button
-    await interaction.update({
-        embeds: [embed],
-        components: [interaction.message.components[0], buttonRow]
-    });
-}
-
-// Function to handle play command
-async function handlePlayCommand(interaction, folderName) {
-    try {
-        await interaction.deferUpdate();
-        
-        const folders = loadFolders();
-        if (!folders[folderName]) {
-            await interaction.editReply(`Folder "${folderName}" not found. Please try again.`);
-            return;
-        }
-
-        // Load songs from the specified folder
-        queue = await loadSongsFromDrive(folders[folderName].id);
-        
-        if (queue.length === 0) {
-            await interaction.editReply('No songs found in this folder!');
-            return;
-        }
-
-        const song = queue[0];
-        queue = queue.slice(1);
-
-        // Create new embed for playback start
-        const embed = new EmbedBuilder()
-            .setColor('#00FF00')
-            .setTitle('🎵 Starting Playback')
-            .setDescription(`Playing from folder: ${folderName}\nTotal songs in queue: ${queue.length + 1}\nPlaying in order: First to Last`)
-            .addFields(
-                { name: 'Current Song', value: song.name },
-                { name: 'Requested By', value: `<@${interaction.user.id}>` }
-            )
-            .setFooter({ 
-                text: `</> JoY • ${getFormattedDateTime()}`,
-                iconURL: client.user.displayAvatarURL()
-            });
-
-        await interaction.editReply({
-            embeds: [embed],
-            components: []
-        });
-
-        await playAudio(song.id, song.name, interaction.channel);
-    } catch (error) {
-        console.error('Error in handlePlayCommand:', error);
-        await interaction.editReply('An error occurred while starting playback.');
-    }
-}
-
-// Modify the player event handler
+// Update the player event handler to handle looping and history
 player.on(AudioPlayerStatus.Idle, () => {
-    // Only process next song if it wasn't triggered by a skip
+    if (!skipInProgress && currentSong) {
+        if (isLooping) {
+            // If looping, add the current song back to the end of the queue
+            queue.push(currentSong);
+        } else {
+            // If not looping and not a manual skip, add to previous songs
+            previousSongs.push(currentSong);
+            // Keep only the last 50 previous songs
+            if (previousSongs.length > 50) {
+                previousSongs.shift();
+            }
+        }
+    }
+
     if (!skipInProgress && queue.length > 0 && connection && currentChannel) {
-        const song = queue[0];
-        queue = queue.slice(1);
+        const song = queue.shift();
         playAudio(song.id, song.name, currentChannel).catch(console.error);
+    } else {
+        currentSong = null;
     }
     skipInProgress = false;
 });
@@ -1275,4 +1343,176 @@ process.on('unhandledRejection', error => {
     console.error('Unhandled promise rejection:', error);
 });
 
-client.login(process.env.DISCORD_TOKEN); 
+client.login(process.env.DISCORD_TOKEN);
+
+// Function to create control buttons
+function createControlButtons(isPaused = false) {
+    const row1 = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId('previous')
+                .setEmoji(CUSTOM_EMOJIS.PREVIOUS.split(':')[2].slice(0, -1))
+                .setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder()
+                .setCustomId(isPaused ? 'resume' : 'pause')
+                .setEmoji(isPaused ? CUSTOM_EMOJIS.PLAY.split(':')[2].slice(0, -1) : CUSTOM_EMOJIS.PAUSE.split(':')[2].slice(0, -1))
+                .setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder()
+                .setCustomId('skip')
+                .setEmoji(CUSTOM_EMOJIS.SKIP.split(':')[2].slice(0, -1))
+                .setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder()
+                .setCustomId('stop')
+                .setEmoji(CUSTOM_EMOJIS.STOP.split(':')[2].slice(0, -1))
+                .setStyle(ButtonStyle.Danger)
+        );
+
+    const row2 = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId('loop')
+                .setEmoji(CUSTOM_EMOJIS.LOOP.split(':')[2].slice(0, -1))
+                .setStyle(isLooping ? ButtonStyle.Success : ButtonStyle.Secondary),
+            new ButtonBuilder()
+                .setCustomId('queue')
+                .setEmoji(CUSTOM_EMOJIS.QUEUE.split(':')[2].slice(0, -1))
+                .setStyle(ButtonStyle.Primary)
+        );
+
+    return [row1, row2];
+}
+
+// Function to create queue select menu
+function createQueueSelectMenu() {
+    if (queue.length === 0) {
+        return new ActionRowBuilder().addComponents(
+            new StringSelectMenuBuilder()
+                .setCustomId('song_select')
+                .setPlaceholder('No songs in queue')
+                .setDisabled(true)
+                .addOptions([
+                    {
+                        label: 'Queue is empty',
+                        description: 'Add songs to the queue first',
+                        value: 'empty',
+                        emoji: CUSTOM_EMOJIS.MUSIC.split(':')[2].slice(0, -1)
+                    }
+                ])
+        );
+    }
+
+    const select = new StringSelectMenuBuilder()
+        .setCustomId('song_select')
+        .setPlaceholder(`Queue: ${queue.length} songs`)
+        .setMinValues(1)
+        .setMaxValues(1);
+
+    // Add up to 25 songs (Discord's limit for select menu options)
+    queue.slice(0, 25).forEach((song, index) => {
+        // Format the song name to fit within Discord's limits
+        let displayName = song.name;
+        if (displayName.length > 90) {
+            displayName = displayName.substring(0, 87) + '...';
+        }
+
+        select.addOptions({
+            label: `${index + 1}. ${displayName}`,
+            description: 'Click to play this song',
+            value: index.toString(),
+            emoji: CUSTOM_EMOJIS.MUSIC.split(':')[2].slice(0, -1)
+        });
+    });
+
+    return new ActionRowBuilder().addComponents(select);
+}
+
+// Function to update the now playing message
+async function updateNowPlayingMessage(channel) {
+    if (!currentSong) return;
+
+    const embed = new EmbedBuilder()
+        .setColor('#00FF00')
+        .setTitle(`${CUSTOM_EMOJIS.MUSIC} Now Playing`)
+        .setDescription(currentSong.name)
+        .addFields(
+            { name: 'Queue Position', value: `Current: ${queue.length} songs remaining` },
+            { name: 'Loop', value: isLooping ? 'Enabled 🔄' : 'Disabled ➡️' }
+        )
+        .setFooter({ 
+            text: `</> JoY • ${getFormattedDateTime()}`,
+            iconURL: client.user.displayAvatarURL()
+        });
+
+    const components = [];
+    
+    // Add control buttons
+    components.push(...createControlButtons(player.state.status === AudioPlayerStatus.Paused));
+    
+    // Add queue menu if there are songs
+    if (queue.length > 0) {
+        components.push(createQueueSelectMenu());
+    }
+
+    // Delete previous playing message if it exists
+    if (currentPlayingMessage) {
+        try {
+            await currentPlayingMessage.delete();
+        } catch (error) {
+            console.error('Error deleting previous message:', error);
+        }
+    }
+
+    // Send new message with updated components
+    currentPlayingMessage = await channel.send({
+        embeds: [embed],
+        components: components
+    });
+}
+
+// Function to handle play command
+async function handlePlayCommand(interaction, folderName) {
+    try {
+        await interaction.deferUpdate();
+        
+        const folders = loadFolders();
+        if (!folders[folderName]) {
+            await interaction.editReply(`Folder "${folderName}" not found. Please try again.`);
+            return;
+        }
+
+        // Load songs from the specified folder
+        queue = await loadSongsFromDrive(folders[folderName].id);
+        
+        if (queue.length === 0) {
+            await interaction.editReply('No songs found in this folder!');
+            return;
+        }
+
+        const song = queue[0];
+        queue = queue.slice(1);
+
+        // Create new embed for playback start
+        const embed = new EmbedBuilder()
+            .setColor('#00FF00')
+            .setTitle(`${CUSTOM_EMOJIS.MUSIC} Starting Playback`)
+            .setDescription(`Playing from folder: ${folderName}\nTotal songs in queue: ${queue.length + 1}\nPlaying in order: First to Last`)
+            .addFields(
+                { name: 'Current Song', value: song.name },
+                { name: 'Requested By', value: `<@${interaction.user.id}>` }
+            )
+            .setFooter({ 
+                text: `</> JoY • ${getFormattedDateTime()}`,
+                iconURL: client.user.displayAvatarURL()
+            });
+
+        await interaction.editReply({
+            embeds: [embed],
+            components: []
+        });
+
+        await playAudio(song.id, song.name, interaction.channel);
+    } catch (error) {
+        console.error('Error in handlePlayCommand:', error);
+        await interaction.editReply('An error occurred while starting playback.');
+    }
+} 
